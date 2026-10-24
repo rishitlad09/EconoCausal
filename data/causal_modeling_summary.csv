@@ -1,0 +1,7 @@
+Metric,Value
+Customers,100000.0
+Policy accuracy,0.89179
+Average profit without discount,181.45763699441477
+Average profit with personalized policy,237.43174974456846
+Average profit gain per customer,55.974112750153694
+Total estimated profit gain,5597411.275015369
