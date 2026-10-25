@@ -5,6 +5,7 @@ __pycache__/
 # Virtual environment
 venv/
 .venv/
+.venv312/
 env/
 
 # Environment variables and secrets
