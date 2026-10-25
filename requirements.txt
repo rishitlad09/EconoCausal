@@ -1,0 +1,18 @@
+pandas
+numpy
+matplotlib
+seaborn
+scikit-learn
+statsmodels
+streamlit
+jupyter
+
+#these  ARE THE REQUIRED LIBRARIES FOR THE PROJECT.
+##pandas: For data manipulation and analysis.
+##numpy: For numerical computations and array operations.
+##matplotlib: For creating static, animated, and interactive visualizations in Python.
+##seaborn: For statistical data visualization based on matplotlib.
+##scikit-learn: For machine learning algorithms and tools.
+##statsmodels: For statistical modeling and hypothesis testing.
+##streamlit: For building interactive web applications for data science and machine learning.
+##jupyter: Run project notebooks and share live code, equations, visualizations, and narrative text.
