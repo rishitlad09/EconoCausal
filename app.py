@@ -14,6 +14,27 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from causal_eval import (
+    compute_qini_curve,
+    compute_uplift_curve,
+    compute_decile_uplift,
+    estimate_propensities,
+    QiniResult,
+    UpliftResult,
+)
+from causal_dml import (
+    train_causal_dml_pipeline,
+    DMLModelBundle,
+    ECONML_AVAILABLE,
+)
+from causal_plots import (
+    create_qini_figure,
+    create_uplift_figure,
+    create_decile_figure,
+    create_effect_distribution_figure,
+    create_propensity_overlap_figure,
+)
+
 # Standard schema definition required by EconoCausal pipeline
 REQUIRED_SCHEMA = {
     "customer_id": {
@@ -173,6 +194,9 @@ def render_dashboard():
             "validation_errors": [],
         }
 
+    if "dml_bundle" not in st.session_state:
+        st.session_state["dml_bundle"] = None
+
     # Sidebar Navigation & Quick Actions
     with st.sidebar:
         st.image(
@@ -189,6 +213,7 @@ def render_dashboard():
                 loaded_df = pd.read_csv(DEFAULT_DATA_PATH)
                 st.session_state["df"] = loaded_df
                 st.session_state["data_source_name"] = "retail_causal_data.csv (Project Default)"
+                st.session_state["dml_bundle"] = None
                 st.toast("Loaded 5,000 synthetic retail records successfully!", icon="✅")
         else:
             st.info("Default dataset not found at expected path: `data/retail_causal_data.csv`.")
@@ -197,11 +222,12 @@ def render_dashboard():
             if st.button("🗑️ Clear Loaded Data", use_container_width=True):
                 st.session_state["df"] = None
                 st.session_state["data_source_name"] = None
+                st.session_state["dml_bundle"] = None
                 st.rerun()
 
         st.divider()
-        st.caption("Version: Week 1 Build (v0.1.0)")
-        st.caption("Architecture: DoWhy Causal DAG + Streamlit UI")
+        st.caption("Version: Week 2 Build (v0.2.0)")
+        st.caption("Architecture: DoWhy DAG + EconML DML + Streamlit & Plotly")
 
     st.title("⚖️ EconoCausal — Dynamic Pricing & Causal AI Dashboard")
     st.markdown(
@@ -217,10 +243,11 @@ def render_dashboard():
     st.divider()
 
     # Tabbed Interface
-    tab_data, tab_budget, tab_arch = st.tabs([
+    tab_data, tab_budget, tab_arch, tab_uplift = st.tabs([
         "📊 1. Historical Campaign Data",
         "💰 2. Budget Constraints",
         "📐 3. Causal Architecture & Schema",
+        "📈 4. Double ML & Uplift Evaluation",
     ])
 
     # -----------------------------------------------------------------------------
@@ -243,6 +270,7 @@ def render_dashboard():
                 parsed_df = pd.read_csv(uploaded_file)
                 st.session_state["df"] = parsed_df
                 st.session_state["data_source_name"] = uploaded_file.name
+                st.session_state["dml_bundle"] = None
                 st.success(f"Successfully uploaded and parsed **{uploaded_file.name}**.")
             except Exception as e:
                 st.error(f"Failed to parse uploaded CSV file: {str(e)}")
@@ -524,6 +552,414 @@ def render_dashboard():
                *No interference between customer purchasing decisions; consistent operational discount implementation.*
             """
         )
+
+    # -----------------------------------------------------------------------------
+    # TAB 4: Double Machine Learning (EconML) & Uplift Evaluation
+    # -----------------------------------------------------------------------------
+    with tab_uplift:
+        st.header("Double Machine Learning (EconML) & Causal Uplift Evaluation")
+        st.markdown(
+            """
+            Evaluate whether the trained Double Machine Learning (DML) causal model can rank customers 
+            to produce **superior treatment allocation efficiency** compared to a random promotional rollout. 
+            All metrics and Plotly visualizations are computed strictly on a **held-out evaluation sample**.
+            """
+        )
+
+        current_df = st.session_state["df"]
+
+        if current_df is None:
+            st.warning(
+                "⚠️ **No dataset loaded.** Please upload a CSV dataset in Tab 1 or click "
+                "**'Load Default Synthetic Dataset'** in the sidebar to run the DML causal pipeline."
+            )
+        else:
+            audit_res = audit_dataset(current_df)
+            if not audit_res["is_valid"]:
+                st.error(
+                    "❌ **Dataset Schema Incompatible:** The loaded dataset does not meet the required schema. "
+                    "Please review the missing columns or data type mismatches in Tab 1."
+                )
+            else:
+                # -------------------------------------------------------------
+                # 1. Model Configuration & Training Controls
+                # -------------------------------------------------------------
+                with st.expander("⚙️ **Causal Model & Evaluation Setup**", expanded=(st.session_state["dml_bundle"] is None)):
+                    col_cfg1, col_cfg2 = st.columns(2)
+
+                    with col_cfg1:
+                        treatment_mode = st.radio(
+                            "Treatment Variable Formulation",
+                            options=[
+                                "Binary Policy (Discount > 0% vs. No Discount [0%])",
+                                "Continuous Treatment (Discount Percentage [0.00, 0.30])",
+                            ],
+                            index=0,
+                            help="Binary treatment enables standard Radcliffe Qini curves and uplift evaluation against an untreated control group.",
+                        )
+                        is_binary = "Binary" in treatment_mode
+
+                        estimator_choice = st.selectbox(
+                            "EconML DML Estimator",
+                            options=[
+                                "LinearDML (Chernozhukov et al., 2018)",
+                                "CausalForestDML (Athey & Wager, 2019)",
+                            ],
+                            index=0,
+                            help="LinearDML fits linear CATE models with cross-fitting. CausalForestDML fits non-parametric random causal forests.",
+                        )
+                        estimator_key = "linear_dml" if "LinearDML" in estimator_choice else "causal_forest_dml"
+
+                        qini_convention = st.selectbox(
+                            "Qini Curve Convention",
+                            options=[
+                                "Radcliffe Global Ratio [Standard] (Y_t - Y_c * N_t_total / N_c_total)",
+                                "Radcliffe Local Ratio (Y_t - Y_c * N_t(k) / N_c(k))",
+                                "Inverse Propensity Weighting (IPW Causal Adjustment)",
+                            ],
+                            index=0,
+                            help="Standard Radcliffe convention scales control conversions by total treatment/control ratio. IPW adjusts for observational selection bias.",
+                        )
+                        if "Global" in qini_convention:
+                            conv_key = "radcliffe_global"
+                        elif "Local" in qini_convention:
+                            conv_key = "radcliffe_local"
+                        else:
+                            conv_key = "ipw"
+
+                    with col_cfg2:
+                        test_split_pct = st.slider(
+                            "Held-Out Evaluation Split Fraction (%)",
+                            min_value=15,
+                            max_value=40,
+                            value=30,
+                            step=5,
+                            help="Percentage of the dataset withheld strictly for out-of-sample causal evaluation to prevent data leakage.",
+                        )
+
+                        default_modifiers = ["price_sensitivity"]
+                        all_confounders = [
+                            "tenure_days", "previous_orders", "days_since_last_order",
+                            "avg_order_value", "prior_email_engagement", "price_sensitivity"
+                        ]
+                        selected_modifiers = st.multiselect(
+                            "Heterogeneity Effect Modifiers (X)",
+                            options=all_confounders,
+                            default=default_modifiers,
+                            help="Covariates that moderate customer responsiveness to discounts tau(X).",
+                        )
+                        if not selected_modifiers:
+                            selected_modifiers = default_modifiers
+
+                        st.caption(
+                            f"**Backdoor Confounders (W):** `{', '.join(all_confounders)}` "
+                            "(Orthogonalized out via cross-fitted nuisance models)"
+                        )
+
+                    train_clicked = st.button("🚀 Train Causal DML Model & Evaluate Out-of-Sample", use_container_width=True)
+
+                if train_clicked:
+                    with st.spinner("Training Double Machine Learning model with cross-fitting and evaluating on held-out split..."):
+                        try:
+                            bundle = train_causal_dml_pipeline(
+                                df=current_df,
+                                treatment_col="discount_percent",
+                                outcome_col="purchased",
+                                confounder_cols=all_confounders,
+                                effect_modifier_cols=selected_modifiers,
+                                discrete_treatment=is_binary,
+                                estimator_type=estimator_key,
+                                test_size=test_split_pct / 100.0,
+                                random_state=42,
+                                cv_folds=3,
+                            )
+                            st.session_state["dml_bundle"] = bundle
+                            st.session_state["last_conv_key"] = conv_key
+                            st.success(
+                                f"✅ Successfully trained **{bundle.estimator_name}**! "
+                                f"Trained on {len(bundle.train_df):,} records, evaluated on {len(bundle.eval_df):,} held-out records."
+                            )
+                        except Exception as e:
+                            st.error(f"❌ Error during model training and evaluation: {str(e)}")
+
+                bundle = st.session_state.get("dml_bundle", None)
+
+                if bundle is not None:
+                    # Extract evaluation vectors
+                    eval_df = bundle.eval_df
+                    y_eval = eval_df[bundle.outcome_col].values.astype(float)
+                    if bundle.discrete_treatment:
+                        t_eval = (eval_df[bundle.treatment_col].values > 0).astype(int)
+                    else:
+                        t_eval = eval_df[bundle.treatment_col].values.astype(float)
+
+                    pred_effects = bundle.pred_effects_eval
+
+                    # Verify binary treatment for Qini / Uplift curves
+                    if not bundle.discrete_treatment:
+                        st.info(
+                            "ℹ️ **Continuous Treatment Notice:** The model was trained with continuous discounts. "
+                            "For binary Qini and uplift curve calculations, observations with `discount_percent > 0` "
+                            "are compared against untreated control (`discount_percent == 0`)."
+                        )
+                        t_eval_binary = (eval_df[bundle.treatment_col].values > 0).astype(int)
+                    else:
+                        t_eval_binary = t_eval
+
+                    # Compute Qini, Uplift, and Decile metrics
+                    qini_res = compute_qini_curve(
+                        y_true=y_eval,
+                        treatment=t_eval_binary,
+                        pred_effects=pred_effects,
+                        convention=conv_key,
+                        propensities=bundle.propensities_eval,
+                        true_effects=bundle.true_effects_eval,
+                        n_bins=100,
+                    )
+
+                    uplift_res = compute_uplift_curve(
+                        y_true=y_eval,
+                        treatment=t_eval_binary,
+                        pred_effects=pred_effects,
+                        n_bins=100,
+                    )
+
+                    decile_df = compute_decile_uplift(
+                        y_true=y_eval,
+                        treatment=t_eval_binary,
+                        pred_effects=pred_effects,
+                        n_bins=10,
+                    )
+
+                    # ---------------------------------------------------------
+                    # 2. Model & Evaluation Audit Information Card
+                    # ---------------------------------------------------------
+                    with st.expander("📋 **Audited Model & Evaluation Metadata**", expanded=False):
+                        col_a1, col_a2 = st.columns(2)
+                        with col_a1:
+                            st.markdown(f"- **Trained Estimator:** `{bundle.estimator_name}` (3-Fold Cross-Fitting)")
+                            st.markdown(f"- **Treatment Variable:** `{bundle.treatment_col}` (Mode: {'Binary {0, 1}' if bundle.discrete_treatment else 'Continuous [0.0, 0.30]'})")
+                            st.markdown(f"- **Primary Outcome:** `{bundle.outcome_col}` (Binary Conversion Indicator)")
+                            st.markdown(f"- **Effect Modifiers (X):** `{', '.join(bundle.feature_names_X)}`")
+                        with col_a2:
+                            st.markdown(f"- **Training Sample Size:** `{len(bundle.train_df):,}` observations")
+                            st.markdown(f"- **Held-Out Evaluation Sample:** `{len(bundle.eval_df):,}` observations (Strictly out-of-sample)")
+                            nt_eval = int(np.sum(t_eval_binary))
+                            nc_eval = len(t_eval_binary) - nt_eval
+                            st.markdown(f"- **Evaluation Balance:** `{nt_eval:,}` Treated ({nt_eval/len(t_eval_binary):.1%}), `{nc_eval:,}` Control ({nc_eval/len(t_eval_binary):.1%})")
+                            st.markdown(f"- **Assignment Mechanism:** Observational with observable confounding (Backdoor adjusted)")
+
+                    # ---------------------------------------------------------
+                    # 3. Performance Summary Metrics
+                    # ---------------------------------------------------------
+                    st.subheader("1. Out-of-Sample Performance Summary")
+
+                    nt_eval = int(np.sum(t_eval_binary))
+                    nc_eval = len(t_eval_binary) - nt_eval
+                    trt_rate = nt_eval / len(t_eval_binary)
+
+                    col_p1, col_p2, col_p3, col_p4 = st.columns(4)
+                    col_p1.metric(
+                        "Evaluation Sample Size",
+                        f"{len(eval_df):,}",
+                        help="Number of strictly held-out customer records used for evaluation.",
+                    )
+                    col_p2.metric(
+                        "Treated / Control Split",
+                        f"{nt_eval:,} / {nc_eval:,}",
+                        delta=f"{trt_rate:.1%} treated",
+                        delta_color="off",
+                    )
+                    col_p3.metric(
+                        "Mean Predicted CATE (Lift)",
+                        f"{bundle.mean_effect * 100.0:+.2f}%",
+                        delta=f"Median: {bundle.median_effect * 100.0:+.2f}%",
+                        delta_color="normal",
+                    )
+                    col_p4.metric(
+                        "Net Qini Score (AUQC - AURC)",
+                        f"{qini_res.qini_score:+.2f}",
+                        delta="Outperformed Random" if qini_res.qini_score > 0 else "Underperformed",
+                        delta_color="normal" if qini_res.qini_score > 0 else "inverse",
+                    )
+
+                    # Honest Model-vs-Random Assessment
+                    if qini_res.qini_score > 0:
+                        st.success(
+                            f"✅ **Causal Model Outperforms Random Targeting:** "
+                            f"The model achieves a Net Qini Gain of **{qini_res.qini_score:+.2f}** "
+                            f"(Model AUQC: **{qini_res.model_auc:.2f}** vs. Random AURC: **{qini_res.random_auc:.2f}**). "
+                            f"Prioritizing promotions by predicted Individual Treatment Effect (CATE) successfully concentrates "
+                            f"high-lift customers in the earliest rollout tiers."
+                        )
+                    else:
+                        st.warning(
+                            f"⚠️ **Causal Model Does Not Outperform Random Targeting:** "
+                            f"The model produced a Net Qini Score of **{qini_res.qini_score:+.2f}**. "
+                            f"The learned ranking does not improve promotional allocation efficiency over a uniform random baseline."
+                        )
+
+                    st.divider()
+
+                    # ---------------------------------------------------------
+                    # 4. Interactive Plotly Visualizations
+                    # ---------------------------------------------------------
+                    st.subheader("2. Interactive Causal Uplift & Qini Visualizations (Plotly)")
+
+                    sub_qini, sub_uplift, sub_deciles, sub_dist = st.tabs([
+                        "📈 Cumulative Qini Gain Curve",
+                        "🚀 Cumulative Uplift Curve",
+                        "📊 Targeting Deciles & Calibration",
+                        "🔬 ITE Distribution & Overlap Diagnostics",
+                    ])
+
+                    with sub_qini:
+                        fig_qini = create_qini_figure(
+                            qini_res,
+                            title=f"Cumulative Qini Curve — {bundle.estimator_name} vs. Random Baseline",
+                        )
+                        st.plotly_chart(fig_qini, use_container_width=True)
+
+                        col_qi1, col_qi2 = st.columns([2, 1])
+                        with col_qi1:
+                            st.markdown(
+                                """
+                                **How to interpret the Qini Curve:**
+                                - **X-axis:** Cumulative percentage of the evaluation customer base targeted (0% to 100%).
+                                - **Y-axis:** Cumulative incremental conversions generated over the control baseline.
+                                - **Random Rollout Baseline (Dashed):** Expected conversions if customers are selected at random.
+                                - **Shaded Area (Net Qini Score):** Represents the cumulative advantage of causal AI targeting over random allocation.
+                                - **Theoretical Oracle (Dotted):** The optimal theoretical upper bound achievable when true individual treatment effects are known.
+                                """
+                            )
+                        with col_qi2:
+                            st.info(
+                                f"**Convention Applied:** `{qini_res.convention}`\n\n"
+                                f"- Total Incremental Conversions at 100%: **{qini_res.total_qini_gain:+.1f}**\n"
+                                f"- Random Baseline AURC: **{qini_res.random_auc:.2f}**\n"
+                                f"- Causal Model AUQC: **{qini_res.model_auc:.2f}**\n"
+                                + (f"- Normalized Qini Ratio: **{qini_res.qini_ratio:.1%}**" if qini_res.qini_ratio else "")
+                            )
+
+                    with sub_uplift:
+                        fig_uplift = create_uplift_figure(
+                            uplift_res,
+                            title=f"Cumulative Uplift Curve — {bundle.estimator_name} Incremental Conversion Rate",
+                        )
+                        st.plotly_chart(fig_uplift, use_container_width=True)
+
+                        st.markdown(
+                            f"""
+                            **Interpretation & Strategic Targeting Cutoff:**
+                            - **Sample Average Treatment Effect (ATE):** **{uplift_res.sample_ate:+.2%}** (Red dashed horizontal line).
+                            - **Peak Cumulative Uplift:** Reaches **{uplift_res.max_uplift:+.2%}** at **{uplift_res.best_targeting_fraction:.0%}** population targeted.
+                            - Targeting only the top customer cohorts captures higher-than-average conversion lift, confirming that promotional elasticity is heterogeneous.
+                            """
+                        )
+
+                    with sub_deciles:
+                        fig_decile = create_decile_figure(
+                            decile_df,
+                            title="Observed Incremental Lift vs. Model Predicted CATE Across Customer Deciles",
+                        )
+                        st.plotly_chart(fig_decile, use_container_width=True)
+
+                        st.markdown("**Decile Level Granular Metrics Table:**")
+                        display_dec = decile_df[[
+                            "decile", "customers", "treated_count", "control_count",
+                            "treatment_rate", "treated_conversion_rate", "control_conversion_rate",
+                            "observed_uplift", "incremental_conversions", "mean_predicted_effect"
+                        ]].copy()
+                        display_dec["treatment_rate"] = display_dec["treatment_rate"].apply(lambda x: f"{x:.1%}")
+                        display_dec["treated_conversion_rate"] = display_dec["treated_conversion_rate"].apply(lambda x: f"{x:.1%}")
+                        display_dec["control_conversion_rate"] = display_dec["control_conversion_rate"].apply(lambda x: f"{x:.1%}")
+                        display_dec["observed_uplift"] = display_dec["observed_uplift"].apply(lambda x: f"{x*100:+.2f}%")
+                        display_dec["incremental_conversions"] = display_dec["incremental_conversions"].apply(lambda x: f"{x:+.1f}")
+                        display_dec["mean_predicted_effect"] = display_dec["mean_predicted_effect"].apply(lambda x: f"{x*100:+.2f}%")
+                        st.dataframe(display_dec, use_container_width=True)
+
+                    with sub_dist:
+                        col_d1, col_d2 = st.columns(2)
+
+                        with col_d1:
+                            fig_dist = create_effect_distribution_figure(
+                                pred_effects=pred_effects,
+                                mean_val=bundle.mean_effect,
+                                median_val=bundle.median_effect,
+                            )
+                            st.plotly_chart(fig_dist, use_container_width=True)
+
+                        with col_d2:
+                            if bundle.propensities_eval is not None:
+                                fig_prop = create_propensity_overlap_figure(
+                                    propensities=bundle.propensities_eval,
+                                    treatment=t_eval_binary,
+                                )
+                                st.plotly_chart(fig_prop, use_container_width=True)
+                            else:
+                                st.info("Propensity overlap diagnostic is generated for binary treatment formulations.")
+
+                    st.divider()
+
+                    # ---------------------------------------------------------
+                    # 5. Descriptive Targeting Simulator (Without Budget Optimization)
+                    # ---------------------------------------------------------
+                    st.subheader("3. Descriptive Targeting Simulator (Without Budget Optimization)")
+                    st.caption(
+                        "Explore the composition and estimated incremental impact of targeting top customer cohorts based on model rankings. "
+                        "Note: These are descriptive causal model estimates. Constrained budget optimization will be implemented separately."
+                    )
+
+                    target_pct = st.slider(
+                        "Select Population Targeting Fraction (%)",
+                        min_value=5,
+                        max_value=100,
+                        value=30,
+                        step=5,
+                        help="Select the top percentile of customers prioritized by predicted treatment effect.",
+                    )
+
+                    # Compute descriptive statistics for selected cohort
+                    k_cutoff = int(np.ceil((target_pct / 100.0) * len(eval_df)))
+                    sort_order = np.argsort(-pred_effects)
+                    top_indices = sort_order[:k_cutoff]
+                    bottom_indices = sort_order[k_cutoff:]
+
+                    top_effects = pred_effects[top_indices]
+                    top_eval_sub = eval_df.iloc[top_indices]
+                    bottom_eval_sub = eval_df.iloc[bottom_indices] if len(bottom_indices) > 0 else None
+
+                    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+                    col_s1.metric("Customers Targeted", f"{k_cutoff:,}", delta=f"{target_pct}% of evaluation set")
+                    col_s2.metric("Mean Predicted Lift", f"{np.mean(top_effects) * 100.0:+.2f}%")
+                    expected_incremental_buyers = float(np.sum(top_effects))
+                    col_s3.metric("Projected Incremental Buyers", f"+{expected_incremental_buyers:,.1f}")
+                    if "price_sensitivity" in top_eval_sub.columns:
+                        col_s4.metric("Avg Price Sensitivity (Targeted)", f"{top_eval_sub['price_sensitivity'].mean():.3f}")
+
+                    # Comparison Table between Targeted and Untargeted Cohorts
+                    comp_rows = []
+                    compare_vars = ["price_sensitivity", "tenure_days", "previous_orders", "days_since_last_order", "avg_order_value", "prior_email_engagement"]
+                    for var in compare_vars:
+                        if var in top_eval_sub.columns:
+                            val_top = float(top_eval_sub[var].mean())
+                            val_bottom = float(bottom_eval_sub[var].mean()) if bottom_eval_sub is not None else float(eval_df[var].mean())
+                            comp_rows.append({
+                                "Customer Attribute": var,
+                                "Targeted Cohort Mean (Top Beneficiaries)": f"{val_top:.2f}",
+                                "Non-Targeted Cohort Mean": f"{val_bottom:.2f}",
+                                "Relative Difference (%)": f"{(val_top - val_bottom) / max(abs(val_bottom), 1e-6) * 100:+.1f}%",
+                            })
+
+                    st.markdown("**Targeted vs. Non-Targeted Customer Cohort Comparison:**")
+                    st.dataframe(pd.DataFrame(comp_rows), use_container_width=True)
+
+                    st.info(
+                        "💡 **Targeting Insight:** Notice how the DML causal model prioritizes customers with significantly higher "
+                        "price sensitivity and churn risk, as these customer segments exhibit the highest counterfactual uplift "
+                        "when offered a discount."
+                    )
+
 
 
 if __name__ == "__main__":

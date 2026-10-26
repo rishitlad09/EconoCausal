@@ -1,19 +1,21 @@
-# EconoCausal - Week 1 Core Dependencies
+# EconoCausal - Dependencies
 # Compatible with Python 3.11
 
 # Data processing and numerical computing
-numpy>=1.24.0,<2.0.0
+numpy>=1.24.0
 pandas>=2.0.0,<3.0.0
 scipy>=1.10.0
 
 # Causal inference and modeling
 dowhy>=0.11.0
+econml>=0.15.0
 scikit-learn>=1.3.0
 statsmodels>=0.14.0
 
 # Graph structures and visualization
 networkx>=3.0
 matplotlib>=3.7.0
+plotly>=5.18.0
 
 # Dashboard interface
 streamlit>=1.30.0
