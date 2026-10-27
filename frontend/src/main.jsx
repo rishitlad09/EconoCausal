@@ -141,7 +141,7 @@ function App() {
             )}
 
             {message && (
-              <p className="message">
+              <p className={message.startsWith("CSV loaded") ? "file-info" : "message"}>
                 <AlertCircle size={16} /> {message}
               </p>
             )}
