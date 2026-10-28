@@ -17,50 +17,82 @@ function App() {
   const [rows, setRows] = useState([]);
   const [message, setMessage] = useState("");
 
-  function handleFileUpload(event) {
-    const file = event.target.files[0];
-    if (!file) return;
+  
 
-    if (!file.name.toLowerCase().endsWith(".csv")) {
-      setMessage("Please upload a CSV file.");
-      setFileName("");
+async function handleFileUpload(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+
+  if (!file.name.toLowerCase().endsWith(".csv")) {
+    setMessage("Please upload a CSV file.");
+    setFileName("");
+    setRows([]);
+    return;
+  }
+
+  setFileName(file.name);
+  setMessage("Reading CSV and connecting to backend...");
+  setRows([]);
+
+  // Read the CSV for the existing five-row preview
+  const reader = new FileReader();
+
+  reader.onload = (e) => {
+    const text = e.target.result;
+    const lines = text.trim().split(/\r?\n/);
+
+    if (lines.length < 2) {
       setRows([]);
+      setMessage("The CSV has no data rows.");
       return;
     }
 
-    setFileName(file.name);
-    setMessage("");
+    const headers = lines[0].split(",").map((h) => h.trim());
 
-    const reader = new FileReader();
+    const preview = lines.slice(1, 6).map((line) => {
+      const values = line.split(",");
+      return Object.fromEntries(
+        headers.map((header, index) => [
+          header,
+          values[index] ?? ""
+        ])
+      );
+    });
 
-    reader.onload = (e) => {
-      const text = e.target.result;
-      const lines = text.trim().split(/\r?\n/);
+    setRows(preview);
+  };
 
-      if (lines.length < 2) {
-        setRows([]);
-        setMessage("The CSV has no data rows.");
-        return;
+  reader.readAsText(file);
+
+  // Send the complete CSV to FastAPI
+  try {
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const response = await fetch(
+      "https://wild-cemetery-4jwg7wv75pj534rw-8000.app.github.dev/dataset/summary",
+      {
+        method: "POST",
+        body: formData
       }
+    );
 
-      const headers = lines[0].split(",").map((h) => h.trim());
+    const result = await response.json();
 
-      const preview = lines.slice(1, 6).map((line) => {
-        const values = line.split(",");
-        return Object.fromEntries(
-          headers.map((header, index) => [
-            header,
-            values[index] ?? ""
-          ])
-        );
-      });
+    if (!response.ok) {
+      throw new Error(result.detail || "Backend request failed.");
+    }
 
-      setRows(preview);
-      setMessage(`CSV loaded. Showing ${preview.length} preview rows.`);
-    };
+    setMessage(
+      `Backend success: ${result.rows} rows, ${result.columns} columns.`
+    );
 
-    reader.readAsText(file);
+    console.log("Backend dataset summary:", result);
+  } catch (error) {
+    setMessage(`Backend upload failed: ${error.message}`);
   }
+}
+
 
   return (
     <div className="app">
